@@ -60,8 +60,8 @@ def mnist_net_model_fn(features, labels, mode, params):
     if mode == tf.estimator.ModeKeys.TRAIN:
         # Add a summary for accuracy
         eval_metric_ops = get_eval_metric_ops(gt_label, predictions['class'])
-        tf.identity(eval_metric_ops["Accuracy"][1], name='train_accuracy')
         tf.summary.scalar('Accuracy', eval_metric_ops["Accuracy"][1])
+
         with tf.name_scope('TRAIN'):
             loss = tf.reduce_mean(entropy, name='loss')  # Computes the mean over all the examples in the batch
             tf.identity(loss, 'cross_entropy')

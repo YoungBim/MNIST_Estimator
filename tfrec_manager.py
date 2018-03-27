@@ -3,141 +3,122 @@ from random import shuffle
 from glob import glob
 import numpy as np
 import tensorflow as tf
-from tqdm import tqdm
+
+# Datasets that the API handles
+from datasets import mnist
+
+datasets_map = {
+    'mnist': mnist
+}
+
+###############
+# WRITER PART #
+###############
 
 
-class TFRecManager:
+def write_tfrecords(raw_dataset, dataset_name, tfrecords_directory, split,
+                    num_shards=1, compression_type=tf.python_io.TFRecordCompressionType.NONE):
     """
-        TODO : Add the generic file header
-        TFRecBuilder Class dedicated to write tf.Records from raw (numpy arrays) data
+    write_tfrecords generates one/multiple .tfrecords files representing the entire dataset
+
+    Args:
+        raw_dataset         : List of tuple of np.arrays [(image, label), [...], (image, label)] corresponding
+                              to the entire dataset
+        dataset_name        : Name of the dataset that should match one of the keys in datasets_map
+        tfrecords_directory : Path of the folders containing one folder per dataset.
+                              Each folder contains tfrecords file(s)
+        split               : One of 'train', 'val', 'test'
+        num_shards          : number of shards the dataset should be split
+        compression_type    : can be any instance of tf.python_io.TFRecordCompressionType (GZIP, NONE, ZLIB)
+
+    Returns:
+        None
     """
 
-    def __init__(self, directory, filename, num_shards=1, compression_type=tf.python_io.TFRecordCompressionType.NONE):
-        """
-        __init__ : Constructor of the TFRecBuilder class
+    # Filenames are made of the dataset name and split part
+    filename = dataset_name + "_" + split
 
-        directory         : path of the tfrecords file(s)
-        filename          : base filename of the .tfrecords file(s) (without the ''tfrecords'' extension)
-        num_shards        : number of shards the dataset should be split
-        compression_type  : can be any instance of tf.python_io.TFRecordCompressionType (GZIP, NONE, ZLIB)
-        """
-        self.directory = directory
-        self.filename = filename
-        self.num_shards = num_shards
-        self.compression_type = compression_type
-        self.options = tf.python_io.TFRecordOptions(compression_type=compression_type)
+    # Compression type TODO : Workaround the crash for GZIP
+    options = tf.python_io.TFRecordOptions(compression_type=compression_type)
 
-    # TODO : create the function mnist_example(self): so that the user just has to re-implement this part :D
+    if not os.path.exists(tfrecords_directory):
+        os.makedirs(tfrecords_directory)
+    if not os.path.exists(os.path.join(tfrecords_directory, dataset_name)):
+        os.makedirs(os.path.join(tfrecords_directory, dataset_name))
 
-    def dataset_shard_to_tfrec(self, tfrec_filename, dataset_shard):
-        """
-        dataset_shard_to_tfrec : builds one tf.Records corresponding to a shard of the entire dataset
+    if num_shards == 1:
+        print("Writing tfrec ", filename)
+        dataset_shard_to_tfrec(raw_dataset, os.path.join(tfrecords_directory, dataset_name, filename), options)
+    else:
+        shard_dataset = np.array_split(raw_dataset, num_shards)
+        for shard_num, shard in enumerate(shard_dataset):
+            print("Writing tfrec ", filename, str(shard_num), "/", len(shard_dataset))
+            dataset_shard_to_tfrec(shard, os.path.join(tfrecords_directory, dataset_name,
+                                                       filename + '_' + (str(shard_num+1))), options)
 
-        tfrec_filename : path of the .tfrecords file that is to write
+
+def dataset_shard_to_tfrec(dataset_shard, tfrec_filename, options):
+    """
+    dataset_shard_to_tfrec builds one tf.Records corresponding to a shard of the entire dataset
+
+    Args:
         dataset_shard  : list of tuple of np.arrays [(image, label), ..., (image, label)] corresponding to the shard
-        """
+        tfrec_filename : path of the .tfrecords file that is to write
+        options        : options for the tf.python_io.TFRecordWriter (see tf.python_io.TFRecordOptions)
 
-        def _int64_feature(value):
-            return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+    Returns:
+        None
+    """
 
-        def _bytes_feature(value):
-            return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+    tfrec_filename = tfrec_filename + '.tfrecords'
+    if os.path.exists(tfrec_filename):
+        print("tfrecords ", tfrec_filename, " already generated")
+        return
+    else:
+        mnist.writer(dataset_shard, tfrec_filename, options)
 
-        def _example_from_dict(dic):
-            return tf.train.Example(features=tf.train.Features(feature=dic))
 
-        def mnist_writer():
-            with tf.python_io.TFRecordWriter(tfrec_filename, options=self.options) as writer:
-                for count, (image, label) in tqdm(enumerate(dataset_shard)):
-                    height, width, depth = image.shape
-                    img_str = image.tostring()
-                    example = _example_from_dict({
-                        'height': _int64_feature(height),
-                        'width': _int64_feature(width),
-                        'depth': _int64_feature(depth),
-                        'label': _int64_feature(int(label)),
-                        'image_raw': _bytes_feature(img_str)
-                    })
-                    writer.write(example.SerializeToString())
+###############
+# PARSER PART #
+###############
 
-        tfrec_filename = tfrec_filename + '.tfrecords'
-        if os.path.exists(tfrec_filename):
-            print("TFRecords ", tfrec_filename, " already generated")
-            return
-        else:
-            mnist_writer()
 
-    def generate_tfrec(self, dataset):
-        """
-        generate_tfrec : generates one/multiple .tfrecords files representing the entire dataset
+def data_input_fn(dataset_name, tfrecords_directory, split, batch_size,
+                  prefetch, shuffle_tfrec=False, buffer_size=None):
+    """
+    data_input_fn provides the input function
 
-        dataset    : list of tuple of np.arrays [(image, label), [...], (image, label)] corresponding to the entire data
-        """
+    Args:
+        dataset_name        : Name of the dataset that should match one of the keys in datasets_map
+        tfrecords_directory : Path of the folders containing one folder per dataset.
+                              Each folder contains tfrecords file(s)
+        split               : One of 'train', 'val', 'test'
+        batch_size          : batch size at which sample will be picked in the dataset
+        prefetch            : number of batches to prefetch
+        shuffle_tfrec       : When set to True, the .tfrecords files and examples are shuffled
+        buffer_size         : Size of the buffer allocated to shuffle the samples (see tf.data.TFRecordDataset.shuffle)
 
-        if not os.path.exists(self.directory):
-            os.makedirs(self.directory)
+    Returns:
+        _input_fn           : The input function required by the tf.contrib.learn.Experiment
+    """
 
-        if self.num_shards == 1:
-            print("Writing tfrec ", self.filename)
-            self.dataset_shard_to_tfrec(os.path.join(self.directory, self.filename), dataset)
-        else:
-            shard_dataset = np.array_split(dataset, self.num_shards)
-            for shard_num, shard in enumerate(shard_dataset):
-                print("Writing tfrec ", self.filename, str(shard_num), "/", len(shard_dataset))
-                self.dataset_shard_to_tfrec(os.path.join(self.directory,
-                                                         self.filename + '_' + (str(shard_num+1))), shard)
+    directory = os.path.join(tfrecords_directory, dataset_name)
 
-    def data_input_fn(self, batch_size, shuffle_tfrec=False):
-        """
-        data_input_fn : provides access to the input function
+    def _input_fn():
+        filenames = glob(os.path.join(directory, dataset_name + '_' + split + '*' + '.tfrecords'))
+        if shuffle_tfrec:                             # If activated, the filename are processed at random
+            shuffle(filenames)
+        dataset = tf.data.TFRecordDataset(filenames)  # TODO : compression_type=compression_type (crashes)
+        dataset = dataset.repeat(None)                # Infinite iterations: let experiment determine num_epochs
+        if shuffle_tfrec:                             # If activated, locally shuffles the data in the .tfrecords
+            dataset = dataset.shuffle(buffer_size=buffer_size * batch_size)
+        dataset = dataset.batch(batch_size)           # Batch the examples
+        dataset = dataset.map(mnist.parser)           # Parse the examples using the parser function
+        dataset = dataset.prefetch(prefetch)          # Make sure the GPU doesn't starves and preload 10 batches
 
-        batch_size        : batch size at which sample will be picked in the dataset
-        """
+        iterator = dataset.make_one_shot_iterator()
+        features, labels = iterator.get_next()
 
-        def mnist_parser(record):
-            """
-            mnist_parser : core function to parse a .tfrecords generated for mnist
+        return features, labels
 
-            """
-            features = {
-                'height': tf.FixedLenFeature([], tf.int64),
-                'width': tf.FixedLenFeature([], tf.int64),
-                'depth': tf.FixedLenFeature([], tf.int64),
-                'label': tf.FixedLenFeature([], tf.int64),
-                'image_raw': tf.FixedLenFeature([], tf.string)
-            }
-            parsed_example = tf.parse_example(record, features)
-
-            height_raw = tf.cast(parsed_example['height'], tf.int32)
-            height_raw.set_shape(shape=batch_size)
-            width_raw = tf.cast(parsed_example['width'], tf.int32)
-            width_raw.set_shape(shape=batch_size)
-            depth_raw = tf.cast(parsed_example['depth'], tf.int32)
-            depth_raw.set_shape(shape=batch_size)
-
-            image = tf.decode_raw(parsed_example['image_raw'], tf.float32)
-            # image_shape = tf.stack([tf.constant(batch_size), height_raw[0], width_raw[0], depth_raw[0]],
-            #                        name='img_shape')
-            # image = tf.reshape(image, image_shape)
-            label = tf.cast(parsed_example['label'], tf.int32)
-
-            return image, label
-
-        def _input_fn():
-            filenames = glob(os.path.join(self.directory, self.filename + '*' + '.tfrecords'))
-            if shuffle_tfrec:                    # If activated, the filename are processed at random
-                shuffle(filenames)
-            dataset = tf.data.TFRecordDataset(filenames)  # compression_type=self.compression_type makes it crash
-            dataset = dataset.repeat(None)       # Infinite iterations: let experiment determine num_epochs
-            if shuffle_tfrec:                    # If activated, localy shuffles the data in the tf.records
-                dataset = dataset.shuffle(buffer_size=20 * batch_size)
-            dataset = dataset.batch(batch_size)  # Batch the examples
-            dataset = dataset.map(mnist_parser)  # Parse the examples using the parser function
-            dataset = dataset.prefetch(10)       # Make sure the GPU doesn't starves and preload 10 batches
-
-            iterator = dataset.make_one_shot_iterator()
-            features, labels = iterator.get_next()
-
-            return features, labels
-
-        return _input_fn
+    return _input_fn
